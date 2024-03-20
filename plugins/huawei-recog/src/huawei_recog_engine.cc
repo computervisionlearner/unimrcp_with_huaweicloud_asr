@@ -42,8 +42,6 @@ extern "C" {
 typedef struct huawei_recog_engine_t huawei_recog_engine_t;
 typedef struct huawei_recog_channel_t huawei_recog_channel_t;
 typedef struct huawei_recog_msg_t huawei_recog_msg_t;
-
-
 DEFINE_string(ak, "", "access key");
 DEFINE_string(sk, "", "secrect key");
 // region, for example cn-east-3, cn-north-4
@@ -57,7 +55,9 @@ DEFINE_string(property, "chinese_8k_general", "");
 DEFINE_string(asr_mode, "continue", "continue, short , sentence");
 DEFINE_int32(readTimeOut, 20000, "read time out, default 20s");
 DEFINE_int32(connectTimeOut, 20000, "connecting time out, default 20s");
-
+DEFINE_int32(vadHead, 10000, "read time out, default 20s");
+DEFINE_int32(vadTail, 800, "connecting time out, default 20s");
+DEFINE_int32(maxSeconds, 60, "connecting time out, default 20s");
 /** Declare this macro to set plugin version */
 MRCP_PLUGIN_VERSION_DECLARE
 
@@ -71,15 +71,32 @@ MRCP_PLUGIN_LOG_SOURCE_IMPLEMENT(RECOG_PLUGIN, "RECOG-PLUGIN")
 /** Use custom log source mark */
 #define RECOG_LOG_MARK APT_LOG_MARK_DECLARE(RECOG_PLUGIN)
 
+enum class Status :int {
+    initial = 0,
+    opened = 1,
+    started = 2,
+    voice_start = 3,
+    recognizing = 4,
+    voice_end = 5,
+    exceeded_silence = 6,
+    ended = 7,
+    closed = 8
+};
+
 class CallBack : public RasrListener {
 public:
-    std::string result;
+    CallBack() {
+        result.clear();
+        status = Status::initial;
+    }
     void OnOpen()
-    {
+    {   
+        status = Status::opened;
         apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "now rasr Connect success");
     }
     void OnStart(std::string text)
     {
+        status = Status::started;
         apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "now rasr receive start response: %s", text.c_str());
     }
     void OnResp(std::string text)
@@ -89,10 +106,12 @@ public:
     }
     void OnEnd(std::string text)
     {
+        status = Status::ended;
         apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "now rasr receive end response: %s", text.c_str());
     }
     void OnClose()
     {
+        status = Status::closed;
         apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "now rasr receive Close");
     }
     void OnError(std::string text)
@@ -101,14 +120,33 @@ public:
     }
     void OnEvent(std::string text)
     {
+        // EXCEED_SILENCE
+        if (text.find("VOICE_START") != std::string::npos) {
+            status = Status::voice_start;
+        } else if (text.find("EXCEEDED_SILENCE") != std::string::npos) {
+            status = Status::exceeded_silence;
+        } else if (text.find("VOICE_END") != std::string::npos) {
+            status = Status::voice_end;
+        }
         apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "now rasr receive event: %s", text.c_str());
     }
     void SetUserInfo(const std::string &str)
     {
         userMeta_ = str;
     }
+    const std::string Result() {
+        return result;
+    }
+    Status GetStatus() {
+        return status;
+    }
+    void SetStatus(Status in) {
+        status = in;
+    }
 private:
     std::string userMeta_;
+    std::string result;
+    Status status;
 };
 
 /** Declaration of recognizer engine methods */
@@ -358,7 +396,8 @@ static apt_bool_t huawei_recog_channel_recognize(
 
     recog_channel->timers_started = TRUE;
 
-    /* get recognizer header */
+    /* get recognizer header */ 
+    // 通过请求header设置vad断句参数  unimrcp提供的断句不够精准，推荐用华为云asr自带的断句能力
     recog_header = (mrcp_recog_header_t *)mrcp_resource_header_get(request);
     if (recog_header) {
         if (mrcp_resource_header_property_check(request, RECOGNIZER_HEADER_START_INPUT_TIMERS) == TRUE) {
@@ -430,11 +469,11 @@ static apt_bool_t huawei_recog_channel_recognize(
     // set whether to transcribe number into arabic numerals, yes or no, default yes,optional operation.
     rasr_request.SetDigitNorm("yes");
     // set vad head, max silent head, [0, 60000], default 10000, optional operation.
-    rasr_request.SetVadHead(10000);
+    rasr_request.SetVadHead(FLAGS_vadHead);
     // set vad tail, max silent tail, [0, 3000], default 500, optional operation.
-    rasr_request.SetVadTail(500);
+    rasr_request.SetVadTail(FLAGS_vadTail);
     // set max seconds of one sentence, [1, 60], default 30, optional operation.
-    rasr_request.SetMaxSeconds(30);
+    rasr_request.SetMaxSeconds(FLAGS_maxSeconds);
     // set whether to return intermediate result, yes or no, default no. optional operation.
     rasr_request.SetIntermediateResult("no");
     // set whether to return word_info, yes or no, default no. optional operation.
@@ -548,7 +587,7 @@ static apt_bool_t huawei_recog_result_load(huawei_recog_channel_t *recog_channel
     /* read the demo result from file  这里是从asr真实结果中读取*/
     mrcp_generic_header_t *generic_header;
 
-    apt_string_assign_n(&message->body, recog_channel->call_back->result.c_str(), recog_channel->call_back->result.size(), message->pool);
+    apt_string_assign_n(&message->body, recog_channel->call_back->Result().c_str(), recog_channel->call_back->Result().size(), message->pool);
 
     /* get/allocate generic header */
     generic_header = mrcp_generic_header_prepare(message);
@@ -602,19 +641,61 @@ static apt_bool_t huawei_recog_stream_write(mpf_audio_stream_t *stream, const mp
         recog_channel->recog_request = NULL;
         return TRUE;
     }
+    bool finish = false;
 
     // 接收的数据帧转给SDK
     if (recog_channel->recog_request) {
-        mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector, frame);
-        switch (det_event) {
-            case MPF_DETECTOR_EVENT_ACTIVITY:
+        // 第622行至660行 是unimrcp提供的断句规则，这里禁用中间两个case（因为效果差），直接用华为云的断句规则
+        // mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector, frame);
+        // switch (det_event) {
+        //     case MPF_DETECTOR_EVENT_ACTIVITY:
+        //         apt_log(RECOG_LOG_MARK,
+        //             APT_PRIO_INFO,
+        //             "Detected Voice Activity " APT_SIDRES_FMT,
+        //             MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+        //         huawei_recog_start_of_input(recog_channel);
+        //         break;
+        //     case MPF_DETECTOR_EVENT_INACTIVITY:
+        //         apt_log(RECOG_LOG_MARK,
+        //             APT_PRIO_INFO,
+        //             "Detected Voice Inactivity " APT_SIDRES_FMT,
+        //             MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+        //         if (recog_channel->rasr_client) {
+        //             recog_channel->rasr_client->SendEnd();
+        //             recog_channel->rasr_client->Close();
+        //         }
+        //         finish = true;
+        //         huawei_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+        //         apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "get RECOGNIZER_COMPLETION_CAUSE_SUCCESS stop recog");
+        //         break;
+        //     case MPF_DETECTOR_EVENT_NOINPUT:
+        //         apt_log(RECOG_LOG_MARK,
+        //             APT_PRIO_INFO,
+        //             "Detected Noinput " APT_SIDRES_FMT,
+        //             MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+        //         if (recog_channel->timers_started == TRUE) {
+        //             if (recog_channel->rasr_client) {
+        //                 recog_channel->rasr_client->SendEnd();
+        //                 recog_channel->rasr_client->Close();
+        //             }
+        //             huawei_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
+        //         }
+        //         finish = true;
+        //         break;
+        //     default:
+        //         break;
+        // }
+        Status cur_status = recog_channel->call_back->GetStatus();
+        switch (cur_status) {
+            case Status::voice_start:
                 apt_log(RECOG_LOG_MARK,
                     APT_PRIO_INFO,
                     "Detected Voice Activity " APT_SIDRES_FMT,
                     MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
                 huawei_recog_start_of_input(recog_channel);
+                recog_channel->call_back->SetStatus(Status::recognizing);
                 break;
-            case MPF_DETECTOR_EVENT_INACTIVITY:
+            case Status::voice_end:
                 apt_log(RECOG_LOG_MARK,
                     APT_PRIO_INFO,
                     "Detected Voice Inactivity " APT_SIDRES_FMT,
@@ -623,9 +704,11 @@ static apt_bool_t huawei_recog_stream_write(mpf_audio_stream_t *stream, const mp
                     recog_channel->rasr_client->SendEnd();
                     recog_channel->rasr_client->Close();
                 }
+                finish = true;
                 huawei_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "get RECOGNIZER_COMPLETION_CAUSE_SUCCESS stop recog");
                 break;
-            case MPF_DETECTOR_EVENT_NOINPUT:
+            case Status::exceeded_silence:
                 apt_log(RECOG_LOG_MARK,
                     APT_PRIO_INFO,
                     "Detected Noinput " APT_SIDRES_FMT,
@@ -637,10 +720,11 @@ static apt_bool_t huawei_recog_stream_write(mpf_audio_stream_t *stream, const mp
                     }
                     huawei_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
                 }
+                finish = true;
                 break;
             default:
                 break;
-        }
+        }        
 
         if (recog_channel->recog_request) {
             if ((frame->type & MEDIA_FRAME_TYPE_EVENT) == MEDIA_FRAME_TYPE_EVENT) {
@@ -665,8 +749,9 @@ static apt_bool_t huawei_recog_stream_write(mpf_audio_stream_t *stream, const mp
             fwrite(frame->codec_frame.buffer, 1, frame->codec_frame.size, recog_channel->audio_out);
         }
 
-        if (recog_channel->rasr_client) {
+        if (recog_channel->rasr_client && !finish) {
             recog_channel->rasr_client->SendBinary((unsigned char*)frame->codec_frame.buffer, frame->codec_frame.size);
+            apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Sending [%d] bytes", frame->codec_frame.size);
         }
     }
     return TRUE;
